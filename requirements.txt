@@ -1,7 +1,0 @@
-# Sem dependências externas — usa apenas a biblioteca padrão do Python
-# Python 3.8+ necessário
-
-# Dependências opcionais para recursos avançados
-colorama>=0.4.6        # cores no terminal (Windows)
-tqdm>=4.66.0           # barra de progresso
-rich>=13.0.0           # output bonito no terminal

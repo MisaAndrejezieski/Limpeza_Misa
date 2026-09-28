@@ -23,6 +23,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 # ---------------------------------------------------------------------------
 # Configuração de logging
@@ -32,7 +33,7 @@ log = logging.getLogger("cleaner")
 
 
 def configurar_logging(arquivo: str | None) -> None:
-    """Configura handlers de log: console + arquivo opcional."""
+    """Configura handlers de log: console (INFO) + arquivo opcional (DEBUG)."""
     log.setLevel(logging.DEBUG)
     log.handlers.clear()
 
@@ -62,7 +63,7 @@ def is_admin() -> bool:
         return False
 
 
-def formatar_bytes(n: int) -> str:
+def formatar_bytes(n: float) -> str:
     """Converte bytes para string legível (KB, MB, GB, TB)."""
     for unidade in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
@@ -135,7 +136,21 @@ def limpar_pasta(
 
     log.info("  Limpando: %s", pasta)
 
-    for item in pasta.iterdir():
+    # Protege o próprio iterdir() contra PermissionError
+    try:
+        itens = list(pasta.iterdir())
+    except PermissionError:
+        res.pulado = True
+        res.erro = f"acesso negado: {pasta} (rode como Administrador)"
+        log.warning("  [SKIP] %s", res.erro)
+        return res
+    except OSError as e:
+        res.pulado = True
+        res.erro = f"erro ao listar {pasta}: {e}"
+        log.warning("  [SKIP] %s", res.erro)
+        return res
+
+    for item in itens:
         try:
             if item.is_file() or item.is_symlink():
                 try:
@@ -172,10 +187,10 @@ def limpar_pasta(
 
         except PermissionError:
             res.arquivos_falha += 1
-            res.detalhes.append(f"sem permissão: {item}")
+            res.detalhes.append(f"sem permissão: {item.name}")
         except OSError as e:
             res.arquivos_falha += 1
-            res.detalhes.append(f"erro em {item}: {e}")
+            res.detalhes.append(f"erro em {item.name}: {e}")
 
     return res
 
@@ -223,12 +238,19 @@ def limpar_lixeira(dry_run: bool) -> Resultado:
         resultado = ctypes.windll.shell32.SHEmptyRecycleBinW(
             None, None, 0x00000007
         )
-        if resultado == 0:
+        codigo = resultado & 0xFFFFFFFF
+
+        if codigo == 0:
             log.info("  Lixeira esvaziada.")
+        elif codigo == 0x8000FFFF:
+            # E_UNEXPECTED — geralmente significa "já está vazia"
+            log.info("  Lixeira já estava vazia.")
+        elif codigo == 0x80070005:
+            log.warning("  Acesso negado à lixeira (rode como Administrador).")
+            res.erro = "acesso negado"
         else:
-            # Códigos comuns: 0x8000FFFF (já vazia)
-            res.erro = f"código 0x{resultado & 0xFFFFFFFF:08X}"
-            log.warning("  Aviso ao esvaziar lixeira: %s", res.erro)
+            log.warning("  Aviso ao esvaziar lixeira: código 0x%08X", codigo)
+            res.erro = f"código 0x{codigo:08X}"
     except Exception as e:  # noqa: BLE001
         res.erro = str(e)
         log.error("  Falha ao esvaziar lixeira: %s", e)
@@ -242,6 +264,7 @@ def limpar_lixeira(dry_run: bool) -> Resultado:
 
 def executar(args: argparse.Namespace) -> int:
     inicio = datetime.now()
+    admin = is_admin()
 
     log.info("=" * 60)
     log.info("  LIMPEZA DE ARQUIVOS TEMPORÁRIOS")
@@ -250,18 +273,28 @@ def executar(args: argparse.Namespace) -> int:
         log.info("  MODO DRY-RUN — nada será apagado de verdade")
     log.info("=" * 60)
 
-    if not is_admin():
+    if not admin:
         log.warning(
             "  AVISO: rodando sem privilégios de administrador.\n"
-            "         Algumas pastas do sistema podem falhar."
+            "         Etapas de sistema (Temp do Windows e Prefetch)\n"
+            "         serão puladas automaticamente."
         )
 
-    alvos: list[tuple[str, callable]] = [("Temp do usuário", limpar_temp_usuario)]
+    alvos: list[tuple[str, Callable[[bool], Resultado]]] = [
+        ("Temp do usuário", limpar_temp_usuario),
+    ]
 
-    if not args.no_windows_temp:
+    if admin and not args.no_windows_temp:
         alvos.append(("Temp do Windows", limpar_temp_windows))
-    if not args.no_prefetch:
+    elif not admin:
+        log.info("")
+        log.info("[SKIP] Temp do Windows — requer Administrador")
+
+    if admin and not args.no_prefetch:
         alvos.append(("Prefetch", limpar_prefetch))
+    elif not admin:
+        log.info("[SKIP] Prefetch — requer Administrador")
+
     if not args.no_recycle:
         alvos.append(("Lixeira", limpar_lixeira))
 
@@ -271,14 +304,11 @@ def executar(args: argparse.Namespace) -> int:
         log.info("")
         log.info("[%d/%d] %s", i, len(alvos), nome)
         try:
-            if nome == "Lixeira":
-                r = func(args.dry_run)
-            else:
-                r = func(args.dry_run)
+            r = func(args.dry_run)
             resultados.append(r)
             log.info(r.resumo())
-            for det in r.detalhes[:5]:  # mostra até 5 detalhes
-                log.debug("      %s", det)
+            for det in r.detalhes[:5]:
+                log.info("      • %s", det)
         except Exception as e:  # noqa: BLE001
             log.exception("  Erro inesperado em %s: %s", nome, e)
             resultados.append(Resultado(nome=nome, erro=str(e)))
